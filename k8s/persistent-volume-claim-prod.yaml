@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: weaviate-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: auto-ebs-sc
+  resources:
+    requests:
+      storage: 1Ti

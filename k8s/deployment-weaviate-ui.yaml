@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weaviate-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weaviate-ui
+  template:
+    metadata:
+      labels:
+        app: weaviate-ui
+    spec:
+      containers:
+      - name: weaviate-ui
+        image: naaive/weaviate-ui:latest
+        envFrom:
+          - configMapRef:
+              name: weaviate-config
+          - secretRef:
+              name: weaviate-secrets
+        ports:
+        - containerPort: 7777

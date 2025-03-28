@@ -1,0 +1,273 @@
+#!/bin/bash
+
+set -e
+
+if [ -z "$1" ] || [ -z "$2" ]; then
+  echo "Ошибка: Укажите действие (update или deploy) и среду (dev или prod)"
+  exit 1
+fi
+
+ACTION=$1
+ENV=$2
+K8S_DIR="k8s"
+CLUSTER_NAME="weaviate-cluster-$ENV"
+REGION=${AWS_REGION:-$(aws configure get region)}
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+
+if [[ -z "$REGION" ]]; then
+    REGION="eu-central-1"
+fi
+
+if [ "$ENV" == "dev" ]; then
+    echo "Переключаем kubectl на Docker Desktop..."
+    kubectl config use-context docker-desktop
+elif [ "$ENV" == "prod" ]; then
+    echo "Переключаем kubectl на AWS EKS ($CLUSTER_NAME)..."
+    aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
+    kubectl config use-context "arn:aws:eks:$REGION:$AWS_ACCOUNT_ID:cluster/$CLUSTER_NAME"
+fi
+
+if [ "$ACTION" == "update" ]; then
+  echo "Обновление Weaviate для среды: $ENV"
+
+  kubectl apply -f "$K8S_DIR/configmap-weaviate.yaml"
+  kubectl apply -f "$K8S_DIR/secret-weaviate.yaml"
+  kubectl apply -f "$K8S_DIR/deployment-weaviate.yaml"
+  kubectl apply -f "$K8S_DIR/service-weaviate.yaml"
+  kubectl apply -f "$K8S_DIR/deployment-i2v-neural.yaml"
+  kubectl apply -f "$K8S_DIR/service-i2v-neural.yaml"
+
+  if [ "$ENV" == "dev" ]; then
+    kubectl apply -f "$K8S_DIR/deployment-weaviate-ui.yaml"
+    kubectl apply -f "$K8S_DIR/service-weaviate-ui.yaml"
+    kubectl apply -f "$K8S_DIR/ingress.yaml"
+  elif [ "$ENV" == "prod" ]; then
+    echo "Обновление Weaviate в AWS EKS ($CLUSTER_NAME)..."
+    aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
+
+    kubectl apply -f "$K8S_DIR/storageclass-prod.yaml"
+    kubectl apply -f "$K8S_DIR/persistent-volume-prod.yaml"
+    kubectl apply -f "$K8S_DIR/configmap-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/secret-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/deployment-i2v-neural.yaml"
+    kubectl apply -f "$K8S_DIR/service-i2v-neural.yaml"
+    kubectl apply -f "$K8S_DIR/deployment-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/service-weaviate.yaml"
+
+    echo "Weaviate успешно обновлён в AWS EKS ($CLUSTER_NAME)!"
+  fi
+
+  echo "Weaviate успешно обновлён для среды: $ENV"
+  exit 0
+fi
+
+if [ "$ACTION" == "deploy" ]; then
+  if [ "$ENV" == "dev" ]; then
+    timeout=300
+    interval=5
+    elapsed=0
+    
+    echo "Разворачиваем Weaviate в ЛОКАЛЬНОМ Kubernetes..."
+    echo "Устанавливаем Nginx Ingress, если он не установлен"
+
+    if ! kubectl get ns ingress-nginx &>/dev/null; then
+      echo "Устанавливаем Nginx Ingress..."
+      kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+      sleep 5
+    fi
+
+    echo "Ожидаем запуск Nginx Ingress..."
+    kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=60s || {
+      echo "Nginx Ingress не запустился!"
+      exit 1
+    }
+    echo "Nginx Ingress запущен!"
+    
+    echo "Проверяем наличие Local Path Provisioner..."
+    if ! kubectl get ns local-path-storage &>/dev/null; then
+      echo "Устанавливаем Local Path Provisioner..."
+      kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+      sleep 5
+    fi
+
+    echo "Настраиваем хранилище..."
+    kubectl apply -f "$K8S_DIR/storageclass-dev.yaml"
+    kubectl apply -f "$K8S_DIR/persistent-volume-claim-dev.yaml"
+
+    kubectl apply -f "$K8S_DIR/configmap-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/secret-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/deployment-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/service-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/deployment-i2v-neural.yaml"
+    kubectl apply -f "$K8S_DIR/service-i2v-neural.yaml"
+    kubectl apply -f "$K8S_DIR/deployment-weaviate-ui.yaml"
+    kubectl apply -f "$K8S_DIR/service-weaviate-ui.yaml"
+
+    echo "Ожидаем запуск Weaviate..."
+    while [[ "$(kubectl get pods -l app=weaviate -o jsonpath='{.items[0].status.phase}' 2>/dev/null)" != "Running" ]]; do
+      if [[ "$elapsed" -ge "$timeout" ]]; then
+        echo "Ошибка: Weaviate не запустился за $timeout секунд!"
+        kubectl get pods -l app=weaviate
+        exit 1
+      fi
+      echo "Weaviate ещё запускается..."
+      sleep "$interval"
+      ((elapsed+=interval))
+    done
+    echo "Weaviate успешно запущен!"
+
+    echo "Открываем port-forwarding для Weaviate и UI..."
+    kubectl port-forward service/weaviate 8080:8080 > /dev/null 2>&1 &
+    kubectl port-forward service/weaviate-ui 3000:7777 > /dev/null 2>&1 &
+
+    echo "Weaviate успешно развернут в среде: dev"
+    echo "Weaviate API доступен по: http://localhost:8080"
+  elif [ "$ENV" == "prod" ]; then
+    CLUSTER_EXISTS=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.status" --output text 2>/dev/null || echo "NotFound")
+    NODEGROUPS=$(eksctl get nodegroup --cluster "$CLUSTER_NAME" -o json 2>/dev/null | jq -r '.[].Name' || echo "")
+    ACTIVE_STACKS=$(aws cloudformation list-stacks --query "StackSummaries[?contains(StackName, '$CLUSTER_NAME') && StackStatus != 'DELETE_COMPLETE'].[StackName]" --output text || echo "")
+    VPC_ID=$(aws ec2 describe-vpcs --query "Vpcs[?Tags[?Key=='eksctl.cluster.k8s.io/v1alpha1/cluster-name' && Value=='$CLUSTER_NAME']].VpcId" --output text || echo "")
+    UNUSED_EIPS=$(aws ec2 describe-addresses --query "Addresses[?AssociationId==null].AllocationId" --output text || echo "")
+    
+    echo "Разворачиваем Weaviate в AWS EKS ($CLUSTER_NAME)..."
+    echo "AWS Account ID: $AWS_ACCOUNT_ID"
+
+    if [[ "$CLUSTER_EXISTS" != "NotFound" ]]; then
+      echo "Кластер $CLUSTER_NAME найден. Начинаем удаление..."
+      echo "Удаляем кластер EKS ($CLUSTER_NAME)..."
+      
+      eksctl delete cluster --name "$CLUSTER_NAME" --region "$REGION" --wait
+    
+      echo "Ожидаем удаления кластера..."
+      while [[ "$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.status" --output text 2>/dev/null || echo "NotFound")" != "NotFound" ]]; do
+        echo "Кластер ещё существует, ждем..."
+        sleep 10
+      done
+      echo "Кластер $CLUSTER_NAME успешно удален!"
+    else
+      echo "Кластер $CLUSTER_NAME не найден. Пропускаем удаление."
+    fi
+
+    echo "Проверяем, остались ли nodegroup в кластере..."
+    if [[ -n "$NODEGROUPS" ]]; then
+      for NODEGROUP in $NODEGROUPS; do
+        echo "Удаляем nodegroup: $NODEGROUP..."
+        eksctl delete nodegroup --cluster "$CLUSTER_NAME" --name "$NODEGROUP" --region "$REGION" --wait || true
+      done
+      echo "Nodegroup удалены!"
+    else
+      echo "Nodegroup не найдены, удаление не требуется."
+    fi
+
+    echo "Проверяем активные CloudFormation стэки, связанные с $CLUSTER_NAME..."
+    if [[ -n "$ACTIVE_STACKS" ]]; then
+      echo "Найдены активные CloudFormation стэки, связанные с $CLUSTER_NAME. Удаляем..."
+        
+      for STACK in $ACTIVE_STACKS; do
+        echo "Удаляем CloudFormation стэк: $STACK..."
+        aws cloudformation delete-stack --stack-name "$STACK" || true
+        sleep 2
+      done
+    
+      echo "Ожидаем удаления всех активных стэков..."
+      for STACK in $ACTIVE_STACKS; do
+        aws cloudformation wait stack-delete-complete --stack-name "$STACK" || echo "Ошибка при удалении стэка: $STACK"
+      done
+    else
+      echo "Активные стэки CloudFormation, связанные с $CLUSTER_NAME, не найдены."
+    fi
+
+    if [[ -n "$VPC_ID" ]]; then
+      echo "Удаляем старый VPC ($VPC_ID)..."
+      aws ec2 delete-vpc --vpc-id "$VPC_ID" || true
+    fi
+
+    for EIP in $UNUSED_EIPS; do
+      aws ec2 release-address --allocation-id "$EIP"
+      echo "Elastic IP ($EIP) освобожден"
+    done
+
+    echo "Создаем новый кластер EKS ($CLUSTER_NAME)..."
+    eksctl create cluster --name "$CLUSTER_NAME" \
+      --region "$REGION" \
+      --nodegroup-name weaviate-nodes \
+      --node-type t3.large \
+      --nodes 3 \
+      --nodes-min 2 \
+      --nodes-max 5 \
+      --managed
+
+    # Получаем VPC и Subnet IDs
+    VPC_ID=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.resourcesVpcConfig.vpcId" --output text)
+    SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output json | jq -r 'join("\", \"")')
+
+    echo "Настраиваем kubectl для нового кластера..."
+    aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
+
+    echo "Удаляем старые версии EBS CSI Driver..."
+    kubectl delete deployment ebs-csi-controller -n kube-system --ignore-not-found
+    kubectl delete daemonset ebs-csi-node -n kube-system --ignore-not-found
+    kubectl delete clusterrole ebs-external-attacher-role --ignore-not-found
+    kubectl delete clusterrole ebs-csi-node-role --ignore-not-found
+    kubectl delete clusterrole ebs-external-provisioner-role --ignore-not-found
+    kubectl delete clusterrole ebs-external-resizer-role --ignore-not-found
+    kubectl delete clusterrole ebs-external-snapshotter-role --ignore-not-found
+
+    sleep 10
+    kubectl get pods -n kube-system | grep ebs || echo "EBS CSI Driver успешно удален"
+    
+    echo "Проверяем наличие IAM OIDC провайдера для кластера..."
+    echo "Создаем IAM-роль для EBS CSI Driver..."
+    
+    eksctl utils associate-iam-oidc-provider --region "$REGION" --cluster "$CLUSTER_NAME" --approve
+    eksctl create iamserviceaccount \
+      --name ebs-csi-controller-sa \
+      --namespace kube-system \
+      --cluster "$CLUSTER_NAME" \
+      --role-name AmazonEKS_EBS_CSI_DriverRole \
+      --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+      --approve
+
+    echo "Проверяем созданную IAM-роль..."
+    aws iam get-role --role-name AmazonEKS_EBS_CSI_DriverRole --output text || echo "Ошибка: IAM-роль не найдена"
+
+    echo "Устанавливаем AWS EBS CSI Driver как Addon..."
+    eksctl create addon --name aws-ebs-csi-driver --cluster "$CLUSTER_NAME" \
+        --service-account-role-arn arn:aws:iam::"$AWS_ACCOUNT_ID":role/AmazonEKS_EBS_CSI_DriverRole --force
+
+    sleep 10
+    kubectl get pods -n kube-system | grep ebs || echo "EBS CSI Driver не запустился"
+
+    echo "Разворачиваем Weaviate в Kubernetes..."
+    kubectl apply -f "$K8S_DIR/storageclass-prod.yaml"
+    kubectl apply -f "$K8S_DIR/persistent-volume-claim-prod.yaml"
+    kubectl apply -f "$K8S_DIR/configmap-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/secret-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/deployment-i2v-neural.yaml"
+    kubectl apply -f "$K8S_DIR/service-i2v-neural.yaml"
+    kubectl apply -f "$K8S_DIR/deployment-weaviate.yaml"
+    kubectl apply -f "$K8S_DIR/service-weaviate.yaml"
+
+    echo "Ожидаем PVC weaviate-pvc..."
+    echo "Ожидаем запуск Weaviate..."
+    
+    sleep 10
+    while [[ $(kubectl get pods -l app=weaviate -o jsonpath='{.items[0].status.phase}' 2>/dev/null) != "Running" ]]; do
+      echo "Weaviate еще запускается..."
+      sleep 5
+    done
+    
+    echo "VPC ID: $VPC_ID"
+    echo "Subnet IDs: $SUBNET_IDS"
+    echo "Weaviate развернут в AWS EKS ($CLUSTER_NAME)"
+    echo "Доступен в VPC: http://weaviate.default.svc.cluster.local:8080"
+    echo "Weaviate развернут в AWS EKS ($CLUSTER_NAME)"
+
+  else
+    echo "Ошибка: Используйте 'dev' или 'prod'"
+    exit 1
+  fi
+else
+  echo "Ошибка: Доступные действия - 'update' или 'deploy'"
+  exit 1
+fi
