@@ -3,17 +3,15 @@ kind: Service
 metadata:
   name: weaviate
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: weaviate
   ports:
     - protocol: TCP
       port: 8080
       targetPort: 8080
-      nodePort: 30080
       name: http
     - protocol: TCP
       port: 50051
       targetPort: 50051
-      nodePort: 30051
       name: grpc

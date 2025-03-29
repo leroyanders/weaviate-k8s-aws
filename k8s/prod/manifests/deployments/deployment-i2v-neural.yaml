@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: i2v-neural
+  labels:
+    app: i2v-neural
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: i2v-neural
+  template:
+    metadata:
+      labels:
+        app: i2v-neural
+    spec:
+      containers:
+        - name: i2v-neural
+          image: semitechnologies/img2vec-pytorch:resnet50
+          env:
+            - name: ENABLE_CUDA
+              value: "0"
+          ports:
+            - containerPort: 8080

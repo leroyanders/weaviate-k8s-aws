@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weaviate
+  labels:
+    app: weaviate
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: weaviate
+  template:
+    metadata:
+      labels:
+        app: weaviate
+    spec:
+      containers:
+        - name: weaviate
+          image: semitechnologies/weaviate:latest
+          args:
+            - "--host=0.0.0.0"
+            - "--port=8080"
+            - "--scheme=http"
+          ports:
+            - containerPort: 8080
+            - containerPort: 50051
+          envFrom:
+            - configMapRef:
+                name: weaviate-config
+            - secretRef:
+                name: weaviate-secrets
+          volumeMounts:
+            - name: storage
+              mountPath: /var/lib/weaviate
+      volumes:
+        - name: storage
+          persistentVolumeClaim:
+            claimName: weaviate-pvc

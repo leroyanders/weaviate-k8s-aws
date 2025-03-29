@@ -11,3 +11,4 @@ resources:
   - services/service-i2v-neural.yaml
   - pods/pod-weaviate-ui.yaml
   - services/service-weaviate-ui.yaml
+  - networks/ingress.yaml
