@@ -24,9 +24,6 @@ fi
 CLUSTER_NAME="weaviate-cluster-$ENV"
 REGION=${AWS_REGION:-$(aws configure get region)}
 AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
-TIMEOUT=300
-INTERVAL=5
-ELAPSED=0
 
 if [ "$ENV" == "dev" ]; then
     echo "Переключаем kubectl на Docker Desktop..."

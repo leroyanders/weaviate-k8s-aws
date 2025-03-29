@@ -45,7 +45,7 @@ deploy-k8s deploy|update prod|dev
 
 ### Notes
 - Ensure the security groups and IAM roles are correctly configured for EKS.
-- Update `k8s/secret-weaviate.yaml` with the correct credentials before applying.
+- Update `k8s/[dev|prod]/config/secret-weaviate.yaml` with the correct credentials before applying.
 - Check Kubernetes pod statuses using:
   ```sh
   kubectl get pods -n weaviate
