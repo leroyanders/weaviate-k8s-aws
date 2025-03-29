@@ -11,6 +11,9 @@ ACTION=$1
 ENV=$2
 K8S_DIR="k8s"
 MANIFESTS_DIR="$K8S_DIR/$ENV/manifests"
+CLUSTER_NAME="weaviate-cluster-$ENV"
+REGION=${AWS_REGION:-$(aws configure get region)}
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
 
 if [[ ! -d "$MANIFESTS_DIR" ]]; then
   echo "Ошибка: Директория $MANIFESTS_DIR не существует!"
@@ -18,20 +21,26 @@ if [[ ! -d "$MANIFESTS_DIR" ]]; then
 fi
 
 if [[ -z "$REGION" ]]; then
-    REGION="eu-central-1"
+  REGION="eu-central-1"
 fi
 
-CLUSTER_NAME="weaviate-cluster-$ENV"
-REGION=${AWS_REGION:-$(aws configure get region)}
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
-
 if [ "$ENV" == "dev" ]; then
-    echo "Переключаем kubectl на Docker Desktop..."
-    kubectl config use-context docker-desktop
+  echo "Переключаем kubectl на Docker Desktop..."
+  kubectl config use-context docker-desktop
 elif [ "$ENV" == "prod" ]; then
-    echo "Переключаем kubectl на AWS EKS ($CLUSTER_NAME)..."
-    aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
-    kubectl config use-context "arn:aws:eks:$REGION:$AWS_ACCOUNT_ID:cluster/$CLUSTER_NAME"
+  echo "Обновляем контекст для кластера $CLUSTER_NAME..."
+  aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
+
+  echo "Проверяем, создан ли контекст..."
+  CONTEXT_EXISTS=$(kubectl config get-contexts --output=name | grep "$CLUSTER_NAME" || echo "")
+
+  if [[ -z "$CONTEXT_EXISTS" ]]; then
+    echo "Ошибка: Контекст для кластера $CLUSTER_NAME не был создан!"
+    exit 1
+  fi
+
+  echo "Переключаемся на контекст $CONTEXT_EXISTS..."
+  kubectl config use-context "$CONTEXT_EXISTS"
 fi
 
 if [ "$ACTION" == "update" ]; then
@@ -79,22 +88,28 @@ if [ "$ACTION" == "deploy" ]; then
       echo "Кластер $CLUSTER_NAME успешно удален!"
     fi
 
-    for NODEGROUP in $NODEGROUPS; do
-      echo "Удаляем nodegroup: $NODEGROUP..."
-      eksctl delete nodegroup --cluster "$CLUSTER_NAME" --name "$NODEGROUP" --region "$REGION" --wait || true
-    done
+    if [[ -n "$NODEGROUPS" ]]; then
+      for NODEGROUP in $NODEGROUPS; do
+        echo "Удаляем nodegroup: $NODEGROUP..."
+        eksctl delete nodegroup --cluster "$CLUSTER_NAME" --name "$NODEGROUP" --region "$REGION" --wait || true
+      done
+    fi
 
-    echo "Проверяем активные CloudFormation стэки..."
-    for STACK in $ACTIVE_STACKS; do
-      aws cloudformation delete-stack --stack-name "$STACK" || true
-      sleep 2
-      aws cloudformation wait stack-delete-complete --stack-name "$STACK" || echo "Ошибка удаления стэка: $STACK"
-    done
+    if [[ -n "$ACTIVE_STACKS" ]]; then
+      for STACK in $ACTIVE_STACKS; do
+        echo "Удаляем стек $STACK..."
+        aws cloudformation delete-stack --stack-name "$STACK" || true
+        aws cloudformation wait stack-delete-complete --stack-name "$STACK" || echo "Ошибка удаления стэка: $STACK"
+      done
+    fi
 
-    for EIP in $UNUSED_EIPS; do
-      aws ec2 release-address --allocation-id "$EIP"
-      echo "Elastic IP ($EIP) освобожден"
-    done
+
+    if [[ -n "$UNUSED_EIPS" ]]; then
+      for EIP in $UNUSED_EIPS; do
+        aws ec2 release-address --allocation-id "$EIP"
+        echo "Elastic IP ($EIP) освобожден"
+      done
+    fi
 
     eksctl create cluster --name "$CLUSTER_NAME" \
       --region "$REGION" \
