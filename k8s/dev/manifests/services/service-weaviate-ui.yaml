@@ -3,10 +3,11 @@ kind: Service
 metadata:
   name: weaviate-ui
 spec:
-  type: LoadBalancer
+  type: NodePort
   selector:
     app: weaviate-ui
   ports:
   - protocol: TCP
     port: 3000
     targetPort: 7777
+    nodePort: 30077

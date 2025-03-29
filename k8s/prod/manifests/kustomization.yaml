@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - config/configmap-weaviate.yaml
+  - config/secret-weaviate.yaml
+  - storage/persistent-volume.yaml
+  - storage/persistent-volume-claim.yaml
+  - pods/pod-i2v-neural.yaml
+  - pods/pod-weaviate.yaml
+  - services/service-i2v-neural.yaml
+  - services/service-weaviate.yaml

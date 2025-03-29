@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: weaviate-ui
+  labels:
+    app: weaviate-ui
+spec:
+  containers:
+    - name: weaviate-ui
+      image: naaive/weaviate-ui:latest
+      ports:
+        - containerPort: 7777
+      envFrom:
+        - configMapRef:
+            name: weaviate-config
+        - secretRef:
+            name: weaviate-secrets
+  initContainers:
+    - name: wait-for-weaviate
+      image: busybox
+      command: [ 'sh', '-c', 'until nc -zv weaviate 8080; do echo "Waiting for Weaviate..."; sleep 5; done' ]
