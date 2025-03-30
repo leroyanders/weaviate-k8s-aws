@@ -32,7 +32,7 @@ elif [ "$ENV" == "prod" ]; then
   aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
 
   echo "Проверяем, создан ли контекст..."
-  CONTEXT_EXISTS=$(kubectl config get-contexts --output=name | grep "$CLUSTER_NAME" || echo "")
+  CONTEXT_EXISTS=$(kubectl config get-contexts --output=name | grep "$CLUSTER_NAME" | head -n 1 || echo "")
 
   if [[ -z "$CONTEXT_EXISTS" ]]; then
     echo "Ошибка: Контекст для кластера $CLUSTER_NAME не был создан!"
@@ -70,31 +70,24 @@ if [ "$ACTION" == "deploy" ]; then
     CLUSTER_EXISTS=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.status" --output text 2>/dev/null || echo "NotFound")
     NODEGROUPS=$(eksctl get nodegroup --cluster "$CLUSTER_NAME" -o json 2>/dev/null | jq -r '.[].Name' || echo "")
     ACTIVE_STACKS=$(aws cloudformation list-stacks --query "StackSummaries[?contains(StackName, '$CLUSTER_NAME') && StackStatus != 'DELETE_COMPLETE'].[StackName]" --output text || echo "")
-    VPC_ID=$(aws ec2 describe-vpcs --query "Vpcs[?Tags[?Key=='eksctl.cluster.k8s.io/v1alpha1/cluster-name' && Value=='$CLUSTER_NAME']].VpcId" --output text || echo "")
-    UNUSED_EIPS=$(aws ec2 describe-addresses --query "Addresses[?AssociationId==null].AllocationId" --output text || echo "")
 
     echo "Разворачиваем Weaviate в AWS EKS ($CLUSTER_NAME)..."
     echo "AWS Account ID: $AWS_ACCOUNT_ID"
 
+    # Удаление старого кластера (если есть)
     if [[ "$CLUSTER_EXISTS" != "NotFound" ]]; then
       echo "Кластер $CLUSTER_NAME найден. Удаляем старый кластер..."
       eksctl delete cluster --name "$CLUSTER_NAME" --region "$REGION" --wait
-
-      echo "Ожидаем удаления кластера..."
-      while [[ "$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.status" --output text 2>/dev/null || echo "NotFound")" != "NotFound" ]]; do
-        echo "Кластер еще существует, ждем..."
-        sleep 10
-      done
-      echo "Кластер $CLUSTER_NAME успешно удален!"
     fi
 
+    # Удаление старых NodeGroups
     if [[ -n "$NODEGROUPS" ]]; then
       for NODEGROUP in $NODEGROUPS; do
-        echo "Удаляем nodegroup: $NODEGROUP..."
         eksctl delete nodegroup --cluster "$CLUSTER_NAME" --name "$NODEGROUP" --region "$REGION" --wait || true
       done
     fi
 
+    # Удаление CloudFormation стэков (если остались после удаления EKS)
     if [[ -n "$ACTIVE_STACKS" ]]; then
       for STACK in $ACTIVE_STACKS; do
         echo "Удаляем стек $STACK..."
@@ -103,14 +96,7 @@ if [ "$ACTION" == "deploy" ]; then
       done
     fi
 
-
-    if [[ -n "$UNUSED_EIPS" ]]; then
-      for EIP in $UNUSED_EIPS; do
-        aws ec2 release-address --allocation-id "$EIP"
-        echo "Elastic IP ($EIP) освобожден"
-      done
-    fi
-
+    # Создание нового кластера
     eksctl create cluster --name "$CLUSTER_NAME" \
       --region "$REGION" \
       --nodegroup-name weaviate-nodes \
@@ -119,11 +105,6 @@ if [ "$ACTION" == "deploy" ]; then
       --nodes-min 2 \
       --nodes-max 5 \
       --managed
-
-    VPC_ID=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.resourcesVpcConfig.vpcId" --output text)
-    SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[].SubnetId" --output json | jq -r 'join(", ")')
-
-    aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
 
     eksctl utils associate-iam-oidc-provider --region "$REGION" --cluster "$CLUSTER_NAME" --approve
     eksctl create iamserviceaccount \
@@ -135,21 +116,72 @@ if [ "$ACTION" == "deploy" ]; then
       --approve
 
     eksctl create addon --name aws-ebs-csi-driver --cluster "$CLUSTER_NAME" \
-        --service-account-role-arn arn:aws:iam::"$AWS_ACCOUNT_ID":role/AmazonEKS_EBS_CSI_DriverRole --force
+      --service-account-role-arn arn:aws:iam::"$AWS_ACCOUNT_ID":role/AmazonEKS_EBS_CSI_DriverRole --force
 
     kubectl apply -k "$MANIFESTS_DIR"
 
+    # Ожидание запуска Weaviate
     sleep 10
     while [[ $(kubectl get pods -l app=weaviate -o jsonpath='{.items[0].status.phase}' 2>/dev/null) != "Running" ]]; do
       echo "Weaviate еще запускается..."
       sleep 5
     done
 
+    # Получаем VPC ID для EKS
+    VPC_ID=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.resourcesVpcConfig.vpcId" --output text)
     echo "VPC ID: $VPC_ID"
-    echo "Subnet IDs: $SUBNET_IDS"
+
+    # Получаем список Security Groups, используемых в EKS
+    EKS_SECURITY_GROUPS=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.resourcesVpcConfig.securityGroupIds" --output json)
+    echo "EKS Security Groups: $EKS_SECURITY_GROUPS"
+
+    # Получаем список Subnets, привязанных к EKS
+    SUBNET_IDS=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.resourcesVpcConfig.subnetIds" --output json)
+    echo "EKS Subnets: $SUBNET_IDS"
+
+    # Получаем список всех Security Groups в VPC
+    ALL_SECURITY_GROUPS=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[*].GroupId" --output json)
+    echo "All Security Groups in VPC: $ALL_SECURITY_GROUPS"
+
+    # Выбираем первую доступную Security Group EKS
+    EKS_SG=$(echo "$EKS_SECURITY_GROUPS" | jq -r '.[0]')
+    if [[ -z "$EKS_SG" || "$EKS_SG" == "null" ]]; then
+      echo "Ошибка: Не удалось найти Security Group для EKS!"
+      exit 1
+    fi
+    echo "Используем Security Group: $EKS_SG"
+
+    # Получаем Worker Nodes IPs
+    WORKER_NODES_IPS=$(aws ec2 describe-instances \
+      --filters "Name=vpc-id,Values=$VPC_ID" "Name=instance-state-name,Values=running" \
+      --query "Reservations[*].Instances[*].PrivateIpAddress" --output text)
+    WEAVIATE_NODE_IP=$(echo "$WORKER_NODES_IPS" | head -n 1)
+    echo "Weaviate доступен на ноде: $WEAVIATE_NODE_IP"
+
+    # Проверяем существование Security Group перед настройкой правил
+    if echo "$ALL_SECURITY_GROUPS" | grep -q "$EKS_SG"; then
+      echo "Security Group $EKS_SG найден. Разрешаем трафик..."
+
+      aws ec2 authorize-security-group-ingress \
+        --group-id "$EKS_SG" \
+        --protocol tcp --port 30080 \
+        --cidr 10.0.0.0/16 || echo "Security Group уже настроен (30080)"
+
+      aws ec2 authorize-security-group-ingress \
+        --group-id "$EKS_SG" \
+        --protocol tcp --port 30051 \
+        --cidr 10.0.0.0/16 || echo "Security Group уже настроен (30051)"
+    else
+      echo "Ошибка: Security Group $EKS_SG не найдена!"
+      exit 1
+    fi
+
+    # Обновляем конфигурацию kubectl
+    aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER_NAME"
+
+    # Вывод информации
     echo "Weaviate развернут в AWS EKS ($CLUSTER_NAME)"
-    echo "Доступен в VPC: http://weaviate.default.svc.cluster.local:8080"
-    echo "Weaviate развернут в AWS EKS ($CLUSTER_NAME)"
+    echo "Lambda должна использовать URL: http://$WEAVIATE_NODE_IP:30080"
   else
     echo "Ошибка: Используйте 'dev' или 'prod'"
     exit 1

@@ -4,7 +4,7 @@ kind: Kustomization
 resources:
   - config/configmap-weaviate.yaml
   - config/secret-weaviate.yaml
-  - storage/persistent-volume.yaml
+  - storage/storageclass.yaml
   - storage/persistent-volume-claim.yaml
   - services/service-weaviate.yaml
   - services/service-i2v-neural.yaml
